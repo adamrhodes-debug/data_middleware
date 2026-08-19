@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Integrations</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Integrations</h1>
+  <span class="sub">Customer data pipeline</span>
+  <span class="clock" id="clock"></span>
+</header>
+
+<!-- Signature element: the pipeline itself, always visible -->
+<div class="pipeline" id="pipeline"></div>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="status"    aria-selected="true">Status</button>
+  <button role="tab" data-tab="quality"   aria-selected="false">Data quality</button>
+  <button role="tab" data-tab="consent"   aria-selected="false">Consent</button>
+  <button role="tab" data-tab="push"      aria-selected="false">Como push</button>
+  <button role="tab" data-tab="conflicts" aria-selected="false">Conflicts</button>
+  <button role="tab" data-tab="lookup"    aria-selected="false">Lookup</button>
+  <button role="tab" data-tab="run"       aria-selected="false">Run</button>
+  <button role="tab" data-tab="registry"  aria-selected="false">Registry</button>
+</nav>
+
+<main>
+  <section id="tab-status"></section>
+  <section id="tab-quality" class="hidden"></section>
+  <section id="tab-consent" class="hidden"></section>
+  <section id="tab-push" class="hidden"></section>
+  <section id="tab-conflicts" class="hidden"></section>
+  <section id="tab-lookup" class="hidden"></section>
+  <section id="tab-run" class="hidden"></section>
+  <section id="tab-registry" class="hidden"></section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
