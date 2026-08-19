@@ -180,7 +180,10 @@ def run_job(run_id, job_key):
         proc = subprocess.Popen(
             job["cmd"], cwd=job["cwd"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env={**os.environ},
+                        text=True, bufsize=1,
+            # Don't leak the dashboard's read-only DB credentials into the
+            # loaders - each one reads its own .env
+            env={k: v for k, v in os.environ.items() if k != "DB"},
         )
         for line in proc.stdout:
             append(line.rstrip())
