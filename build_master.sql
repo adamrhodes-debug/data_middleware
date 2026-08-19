@@ -69,6 +69,82 @@ VALUES ('grubtech.com'), ('yolkbrands.com')
 ON CONFLICT DO NOTHING;
 
 
+-- ── Market string parsing ────────────────────────────────────────
+-- Wi-fi markets look like  {brand}-{country}-{venue}  where country
+-- is a multi-word slug, e.g:
+--   pickl-united-arab-emirates-jbr        -> PICKL, UAE, JBR
+--   southpour-united-arab-emirates-city-walk -> SOUTHPOUR, UAE, CITY-WALK
+--   pickl-jordan-vista-4                  -> PICKL, JORDAN, VISTA-4
+--
+-- Country slugs are listed here so multi-word ones stay intact.
+-- Add a row when you open in a new country.
+
+CREATE TABLE IF NOT EXISTS country_map (
+    slug TEXT PRIMARY KEY,   -- as it appears in the market string
+    tag  TEXT NOT NULL       -- the tag to use
+);
+
+INSERT INTO country_map (slug, tag) VALUES
+    ('united-arab-emirates', 'UAE'),
+    ('jordan',               'JORDAN'),
+    ('saudi-arabia',         'KSA'),
+    ('kuwait',               'KUWAIT'),
+    ('qatar',                'QATAR'),
+    ('bahrain',              'BAHRAIN'),
+    ('oman',                 'OMAN')
+ON CONFLICT (slug) DO NOTHING;
+
+
+CREATE OR REPLACE FUNCTION parse_market(m TEXT)
+RETURNS TEXT[] AS $pm$
+DECLARE
+    clean   TEXT;
+    brand   TEXT;
+    rest    TEXT;
+    c       RECORD;
+    country TEXT;
+    venue   TEXT;
+BEGIN
+    IF m IS NULL OR btrim(m) = '' THEN
+        RETURN ARRAY[]::text[];
+    END IF;
+
+    -- Drop any query string that leaked in, e.g. '...city-walk?cmd=login'
+    clean := lower(btrim(split_part(m, '?', 1)));
+    clean := regexp_replace(clean, '-+$', '');
+
+    brand := split_part(clean, '-', 1);
+    rest  := substring(clean from length(brand) + 2);
+
+    -- Longest slug first, so 'saudi-arabia' wins over any 'saudi'
+    FOR c IN SELECT * FROM country_map ORDER BY length(slug) DESC LOOP
+        IF rest = c.slug THEN
+            country := c.tag;
+            venue   := NULL;
+            EXIT;
+        ELSIF rest LIKE c.slug || '-%' THEN
+            country := c.tag;
+            venue   := substring(rest from length(c.slug) + 2);
+            EXIT;
+        END IF;
+    END LOOP;
+
+    -- Unrecognised country: assume it's the second segment and carry on,
+    -- so a new market still produces sensible tags.
+    IF country IS NULL THEN
+        country := split_part(rest, '-', 1);
+        venue   := substring(rest from length(split_part(rest, '-', 1)) + 2);
+    END IF;
+
+    RETURN ARRAY[upper(brand), upper(country)]
+           || CASE WHEN COALESCE(venue, '') = ''
+                   THEN ARRAY[]::text[]
+                   ELSE ARRAY[upper(venue)]      -- hyphens kept: CITY-WALK
+              END;
+END;
+$pm$ LANGUAGE plpgsql IMMUTABLE;
+
+
 -- ── Tag helper ───────────────────────────────────────────────────
 -- Uppercases, trims, drops blanks, removes duplicates, and keeps the
 -- original order - so the source tag stays first.
@@ -186,9 +262,8 @@ INSERT INTO source_map (
     $$CASE WHEN dob ~ '^\d{4}-\d{2}-\d{2}'
            THEN substring(dob from 1 for 10)::date END$$,
     'WIFI',                                  -- first tag, always
-    -- lastmarket looks like 'pickl-uae-jbr' - split it on hyphens so
-    -- each part becomes its own tag: PICKL, UAE, JBR
-    $$string_to_array(lastmarket, '-')$$,
+    -- see parse_market() above
+    $$parse_market(lastmarket)$$,
     NULL,          -- portal never saves its marketing checkbox
     NULL,
     10
@@ -199,7 +274,7 @@ INSERT INTO source_map (
     NULL,
     NULL,
     'REVEL',                                 -- first tag, always
-    $$ARRAY['UAE', brand]$$,                 -- then country, then brand
+    $$ARRAY['UAE', brand]$$,                 -- Revel has no country field
     'email_opt_in',
     'email_ok',    -- only rows that passed the email checks
     20
