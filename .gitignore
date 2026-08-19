@@ -1,0 +1,15 @@
+# Credentials - never commit
+.env
+*.json
+firebase-key.json
+
+# Machine-specific
+vm-audit*.txt
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
