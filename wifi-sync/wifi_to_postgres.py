@@ -11,6 +11,10 @@ next run. You never write any SQL.
 
 import json
 import os
+# Make the Firebase key path absolute and independent of how we're launched
+_here = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS",
+                      os.path.join(_here, "firebase-key.json"))
 from datetime import datetime, date
 
 import psycopg2
