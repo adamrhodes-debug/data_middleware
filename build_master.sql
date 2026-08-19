@@ -161,6 +161,23 @@ RETURNS TEXT[] AS $ct$
 $ct$ LANGUAGE sql IMMUTABLE;
 
 
+-- ── Name helper ──────────────────────────────────────────────────
+-- Source systems use placeholder text where a name is missing.
+-- Treat those as no name rather than sending them to Como as if
+-- someone were actually called "Unknown".
+
+CREATE OR REPLACE FUNCTION clean_name(v TEXT)
+RETURNS TEXT AS $cn$
+    SELECT CASE
+        WHEN lower(btrim(COALESCE(v, ''))) IN (
+            '', '-', '.', 'n/a', 'na', 'none', 'null', 'unknown',
+            'no name', 'noname', 'test', 'guest', 'customer', 'xxx', '???'
+        ) THEN NULL
+        ELSE btrim(v)
+    END;
+$cn$ LANGUAGE sql IMMUTABLE;
+
+
 -- ── The refresh function ─────────────────────────────────────────
 -- Walks every enabled source_map row and merges that table in.
 -- Processed in priority order; the first source to supply a value for
@@ -198,6 +215,8 @@ BEGIN
             WHERE %1$s IS NOT NULL
               AND trim(%1$s) <> ''
               AND %1$s ~ '^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$'
+              -- Local part that's only digits is a placeholder, not a person
+              AND split_part(%1$s, '@', 1) !~ '^[0-9]+$'
               AND lower(split_part(%1$s, '@', 2))
                     NOT IN (SELECT domain FROM blocked_domains)
               AND (%10$s)
@@ -222,8 +241,8 @@ BEGIN
                OR NOT (EXCLUDED.sources <@ master_customers.sources)
         $f$,
             m.email_expr,                                                          -- %1
-            COALESCE('nullif(trim(' || m.first_name_expr  || '), '''')', 'NULL'),   -- %2
-            COALESCE('nullif(trim(' || m.last_name_expr   || '), '''')', 'NULL'),   -- %3
+            COALESCE('clean_name(' || m.first_name_expr || ')', 'NULL'),            -- %2
+            COALESCE('clean_name(' || m.last_name_expr  || ')', 'NULL'),            -- %3
             COALESCE('nullif(trim(' || m.nationality_expr || '), '''')', 'NULL'),   -- %4
             COALESCE(m.birthday_expr, 'NULL'),                                      -- %5
             m.source_tag,                                                           -- %6 first tag
@@ -264,7 +283,10 @@ INSERT INTO source_map (
     'WIFI',                                  -- first tag, always
     -- see parse_market() above
     $$parse_market(lastmarket)$$,
-    NULL,          -- portal never saves its marketing checkbox
+    -- The portal requires a consent checkbox before it will submit, so
+    -- everyone in this table consented - it just isn't recorded per row.
+    -- Once index.html saves the checkbox, point this at that column.
+    $$true$$,
     NULL,
     10
 ),
@@ -275,7 +297,10 @@ INSERT INTO source_map (
     NULL,
     'REVEL',                                 -- first tag, always
     $$ARRAY['UAE', brand]$$,                 -- Revel has no country field
-    'email_opt_in',
+    -- Revel has no opt-out mechanism: giving an email is the opt-in, and
+    -- email_opt_in is a default rather than a recorded decision. Don't
+    -- read it as a decline.
+    $$true$$,
     'email_ok',    -- only rows that passed the email checks
     20
 )
