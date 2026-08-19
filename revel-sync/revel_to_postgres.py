@@ -40,23 +40,29 @@ STATE_TABLE = "revel_sync_state"
 # bad_format, missing, gibberish
 DISCARD_REASONS = {"internal_domain"}
 
+def load_env():
+    """Read the .env file sitting next to this script.
+
+    Values here always win over anything inherited from the parent
+    process - otherwise a script launched by the dashboard picks up
+    the dashboard's read-only database credentials instead of its own.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        sys.exit(f"Missing {path} - see the setup notes.")
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ[key.strip()] = value.strip()
+
+
+load_env()
+
 DB = os.environ["DB"]
 
 # Brands are read from the .env file next to this script.
 BRANDS = ["SOUTHPOUR", "PICKL", "BONBIRD"]
-
-
-def load_env():
-    """Read the .env file sitting next to this script."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(path):
-        sys.exit(f"Missing {path} - see the setup notes.")
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                os.environ[key.strip()] = value.strip()
 
 
 # ── Email quality checks (ported from validate-email.php) ────────
@@ -494,7 +500,6 @@ if __name__ == "__main__":
                         help="forget saved progress and backfill from scratch")
     args = parser.parse_args()
 
-    load_env()
     brands = [args.brand.upper()] if args.brand else BRANDS
 
     conn = psycopg2.connect(DB)

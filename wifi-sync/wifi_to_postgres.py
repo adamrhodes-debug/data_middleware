@@ -11,23 +11,47 @@ next run. You never write any SQL.
 
 import json
 import os
-# Make the Firebase key path absolute and independent of how we're launched
-_here = os.path.dirname(os.path.abspath(__file__))
-os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS",
-                      os.path.join(_here, "firebase-key.json"))
+import sys
 from datetime import datetime, date
 
 import psycopg2
 from google.cloud import firestore
 
+
+def load_env():
+    """Read the .env file sitting next to this script.
+
+    Values here always win over anything inherited from the parent
+    process - otherwise a script launched by the dashboard picks up
+    the dashboard's read-only database credentials instead of its own.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # The Firebase key lives beside this script, so point at it directly
+    # rather than relying on a variable set in someone's shell.
+    key = os.path.join(here, "firebase-key.json")
+    if os.path.exists(key):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key
+
+    path = os.path.join(here, ".env")
+    if not os.path.exists(path):
+        sys.exit(f"Missing {path} - see the setup notes.")
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ[k.strip()] = v.strip()
+
+
+load_env()
+
 # ── Settings ─────────────────────────────────────────────────────
-# Change these if needed.
 
-FIREBASE_PROJECT = "yolk-wifi"
-FIREBASE_COLLECTION = "customers"
-POSTGRES_TABLE = "wifi_guests"
+FIREBASE_PROJECT = os.environ.get("FIREBASE_PROJECT", "yolk-wifi")
+FIREBASE_COLLECTION = os.environ.get("FIREBASE_COLLECTION", "customers")
+POSTGRES_TABLE = os.environ.get("WIFI_TABLE", "wifi_guests")
 
-DB = os.environ["DB"]   # e.g. "dbname=ingest user=ingest password=xxx host=localhost"
+DB = os.environ["DB"]
 
 
 # ── Step 1: read everything out of Firestore ─────────────────────

@@ -32,6 +32,10 @@ import requests
 # ── Config ───────────────────────────────────────────────────────
 
 def load_env():
+    """Read the .env file next to this script. Values here always win
+    over anything inherited from the parent process, so a script
+    launched by the dashboard uses its own credentials, not the
+    dashboard's read-only ones."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(path):
         sys.exit(f"Missing {path}")
