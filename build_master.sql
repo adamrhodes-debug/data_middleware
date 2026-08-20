@@ -20,8 +20,16 @@ CREATE TABLE IF NOT EXISTS master_customers (
     last_name       TEXT,               -- Last Name
     nationality     TEXT,               -- Nationality
     birthday        DATE,               -- Birthday (send as dd.MM.yyyy)
-    tags            TEXT[],             -- Tag, e.g. {UAE,BONBIRD,MAILCHIMP}
+    tags            TEXT[],             -- kept for reference and the CSV export
                                         --   first element is always the source
+
+    -- The same information as separate fields, because Como segments
+    -- on exact field matches. A single comma-joined string forces
+    -- fragile "contains" conditions; these give clean equals.
+    src_system      TEXT,               -- WIFI / REVEL / ...
+    brand           TEXT,               -- PICKL / BONBIRD / SOUTHPOUR
+    country         TEXT,               -- UAE / JORDAN
+    venue           TEXT,               -- CITY-WALK / JBR / VISTA-4
     allow_email     BOOLEAN,            -- AllowEmail (NULL = unknown)
 
     -- Duplicate detection (see find_duplicates() below)
@@ -39,6 +47,8 @@ CREATE TABLE IF NOT EXISTS master_customers (
 CREATE INDEX IF NOT EXISTS master_needs_push_idx
     ON master_customers (needs_push) WHERE needs_push;
 CREATE INDEX IF NOT EXISTS master_email_key_idx ON master_customers (email_key);
+CREATE INDEX IF NOT EXISTS master_brand_idx ON master_customers (brand);
+CREATE INDEX IF NOT EXISTS master_venue_idx ON master_customers (venue);
 CREATE INDEX IF NOT EXISTS master_duplicate_idx
     ON master_customers (duplicate_of) WHERE duplicate_of IS NOT NULL;
 
@@ -379,6 +389,39 @@ INSERT INTO source_map (
 ON CONFLICT (source_table) DO NOTHING;
 
 
+-- ── Split tags into segmentable fields ───────────────────────────
+-- Tags arrive as an ordered array, e.g. {WIFI, PICKL, UAE, CITY-WALK}.
+-- Position isn't reliable once two sources merge, so each dimension is
+-- identified by what it contains rather than where it sits.
+
+CREATE OR REPLACE FUNCTION split_dimensions()
+RETURNS TABLE (with_brand BIGINT, with_venue BIGINT) AS $sd$
+BEGIN
+    UPDATE master_customers m
+    SET src_system = (
+            SELECT t FROM unnest(m.tags) AS t
+            WHERE t IN ('WIFI', 'REVEL') LIMIT 1),
+        brand = (
+            SELECT t FROM unnest(m.tags) AS t
+            WHERE t IN ('PICKL', 'BONBIRD', 'SOUTHPOUR') LIMIT 1),
+        country = (
+            SELECT t FROM unnest(m.tags) AS t
+            WHERE t IN (SELECT tag FROM country_map) LIMIT 1),
+        venue = (
+            -- Whatever's left over is the venue
+            SELECT t FROM unnest(m.tags) AS t
+            WHERE t NOT IN ('WIFI', 'REVEL', 'PICKL', 'BONBIRD', 'SOUTHPOUR')
+              AND t NOT IN (SELECT tag FROM country_map)
+            LIMIT 1);
+
+    RETURN QUERY
+    SELECT count(*) FILTER (WHERE brand IS NOT NULL),
+           count(*) FILTER (WHERE venue IS NOT NULL)
+    FROM master_customers;
+END;
+$sd$ LANGUAGE plpgsql;
+
+
 -- ── Duplicate detection ──────────────────────────────────────────
 -- master_customers is keyed on email, so identical addresses can't
 -- both be present. What we're looking for is the SAME PERSON under
@@ -492,6 +535,10 @@ HAVING count(*) > 1;
 SELECT * FROM refresh_master();
 
 \echo ''
+\echo '=== splitting tags into fields ==='
+SELECT * FROM split_dimensions();
+
+\echo ''
 \echo '=== duplicate check ==='
 SELECT * FROM find_duplicates();
 
@@ -505,6 +552,12 @@ SELECT
     count(*) FILTER (WHERE duplicate_of IS NOT NULL) AS duplicates_held_back,
     count(*) FILTER (WHERE needs_push)          AS awaiting_push
 FROM master_customers;
+
+\echo ''
+\echo '=== segmentable fields ==='
+SELECT brand, country, venue, count(*) AS people
+FROM master_customers
+GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 25;
 
 \echo ''
 \echo '=== mistyped domains corrected on the way in ==='

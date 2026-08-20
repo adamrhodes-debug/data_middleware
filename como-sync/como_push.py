@@ -78,7 +78,13 @@ def brand_config(brand):
                                       "CentralCustomerSync").strip(),
         "source_version": os.environ.get(f"{brand}_COMO_SOURCE_VERSION", "1.0.0").strip(),
         "nationality_field": os.environ.get(f"{brand}_COMO_NATIONALITY_FIELD", "").strip(),
-        "tag_field": os.environ.get(f"{brand}_COMO_TAG_FIELD", "").strip(),
+        # Which Como generic field holds each dimension. Blank = don't send.
+        "dimension_fields": {
+            "src_system": os.environ.get(f"{brand}_COMO_FIELD_SOURCE", "").strip(),
+            "brand":      os.environ.get(f"{brand}_COMO_FIELD_BRAND", "").strip(),
+            "country":    os.environ.get(f"{brand}_COMO_FIELD_COUNTRY", "").strip(),
+            "venue":      os.environ.get(f"{brand}_COMO_FIELD_VENUE", "").strip(),
+        },
     }
 
 
@@ -163,17 +169,18 @@ def registration_data(row, cfg):
         data["allowEmail"] = row["allow_email"]
     if cfg["nationality_field"] and row["nationality"]:
         data[cfg["nationality_field"]] = row["nationality"]
-    if cfg["tag_field"] and row["tags"]:
-        if cfg["tag_field"] == "tags":
-            # Como's own field - send the array as-is, not a JSON string.
-            #
-            # NOTE: Como also keeps its own behavioural tags on a member
-            # (the "*Behavior|...*" ones). Confirm with Como whether
-            # sending tags REPLACES the whole array or adds to it. If it
-            # replaces, this would wipe those on every push.
-            data["tags"] = row["tags"]
-        else:
-            data[cfg["tag_field"]] = json.dumps(row["tags"])
+    # Source, brand, country and venue each go to their own Como
+    # generic field, so campaigns can match on them exactly. A single
+    # comma-joined string would force fragile "contains" conditions and
+    # couldn't express "brand = X AND country = Y".
+    #
+    # Como's own `tags` field is not writable via the API - it's
+    # populated by their rule engine - so we send the underlying data
+    # and let rules derive tags from it if you set them up.
+    for key, field in cfg["dimension_fields"].items():
+        if field and row.get(key):
+            data[field] = row[key]
+
     return data
 
 
@@ -473,8 +480,10 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
         rows = pending_for(conn, name, limit=limit, retry_failed=retry_failed)
         print(f"\n=== {name}: {len(rows):,} to push ===")
 
-        if not cfg["nationality_field"] or not cfg["tag_field"]:
-            print("  (Nationality/Tag fields unset - those values won't be sent)")
+        unset = [k for k, v in cfg["dimension_fields"].items() if not v]
+        if unset:
+            print(f"  (no Como field configured for: {', '.join(unset)} "
+                  f"- those values won't be sent)")
 
         counts = {"ok": 0, "exists": 0, "failed": 0, "conflict": 0}
 
