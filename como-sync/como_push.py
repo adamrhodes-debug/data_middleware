@@ -164,19 +164,48 @@ def registration_data(row, cfg):
     if cfg["nationality_field"] and row["nationality"]:
         data[cfg["nationality_field"]] = row["nationality"]
     if cfg["tag_field"] and row["tags"]:
-        data[cfg["tag_field"]] = json.dumps(row["tags"])
+        if cfg["tag_field"] == "tags":
+            # Como's own field - send the array as-is, not a JSON string.
+            #
+            # NOTE: Como also keeps its own behavioural tags on a member
+            # (the "*Behavior|...*" ones). Confirm with Como whether
+            # sending tags REPLACES the whole array or adds to it. If it
+            # replaces, this would wipe those on every push.
+            data["tags"] = row["tags"]
+        else:
+            data[cfg["tag_field"]] = json.dumps(row["tags"])
     return data
 
 
 # ── Como calls ───────────────────────────────────────────────────
 
-def call(cfg, path, payload):
-    r = requests.post(f"{BASE_URL}/api/v4/advanced/{path}",
+def call(cfg, path, payload, advanced=True):
+    prefix = "advanced/" if advanced else ""
+    r = requests.post(f"{BASE_URL}/api/v4/{prefix}{path}",
                       json=payload, headers=headers(cfg), timeout=TIMEOUT)
     try:
         return r.status_code, r.json()
     except ValueError:
         return r.status_code, None
+
+
+def member_exists(cfg, email):
+    """Ask Como whether this email is already a member.
+
+    Returns True, False, or None if we couldn't tell. Read-only - it
+    never modifies anything.
+    """
+    try:
+        _, body = call(cfg, "getMemberDetails",
+                       {"customer": {"email": email}}, advanced=False)
+    except requests.RequestException:
+        return None
+
+    if body and body.get("status") == "ok":
+        return True
+    if CUSTOMER_NOT_FOUND in error_codes(body):
+        return False
+    return None
 
 
 def error_codes(body):
@@ -192,10 +221,41 @@ def error_codes(body):
     return codes
 
 
-def push_one(row, cfg):
+def push_one(row, cfg, update_existing=False):
+    """Returns (status, detail).
+
+    By default an existing Como member is left completely alone -
+    we check first, and only create people who aren't there yet.
+    Pass update_existing=True to overwrite their details instead.
+    """
     email = row["email"]
     fields = registration_data(row, cfg)
 
+    if not update_existing:
+        found = member_exists(cfg, email)
+
+        if found is True:
+            return "exists", "already in Como - left alone"
+
+        if found is None:
+            return "failed", "couldn't check whether they exist"
+
+        # Not a member yet - create them.
+        try:
+            _, body = call(cfg, "registration/quick",
+                           {"customer": {"email": email, **fields}})
+        except requests.RequestException as exc:
+            return "failed", str(exc)
+
+        if body and body.get("status") == "ok":
+            return "ok", "created"
+        if ALREADY_EXISTS in error_codes(body):
+            # Created between our check and this call, or the address
+            # belongs to a different membership.
+            return "exists", "already in Como"
+        return "failed", json.dumps(body)[:200]
+
+    # --- update-existing mode ---
     try:
         _, body = call(cfg, "updateMember", {
             "customer": {"email": email},
@@ -215,13 +275,9 @@ def push_one(row, cfg):
                            {"customer": {"email": email, **fields}})
         except requests.RequestException as exc:
             return "failed", str(exc)
-
         if body and body.get("status") == "ok":
             return "ok", "created"
         if ALREADY_EXISTS in error_codes(body):
-            # Email belongs to a different membership. Como's fix sends
-            # a 2FA code to the customer - not something an unattended
-            # job should trigger.
             return "conflict", json.dumps(body)[:200]
         return "failed", json.dumps(body)[:200]
 
@@ -270,9 +326,7 @@ def record(conn, email, brand, status, detail):
 def pending_for(conn, brand, limit=None, retry_failed=False):
     """Customers tagged with this brand that still need pushing:
     never pushed, or changed since, or previously failed."""
-    ok_clause = "s.status = 'ok' AND NOT m.needs_push"
-    if retry_failed:
-        ok_clause = "s.status = 'ok' AND NOT m.needs_push"
+    retry = "" if retry_failed else "AND (s.status IS NULL OR s.status <> 'conflict')"
 
     sql = f"""
         SELECT m.*
@@ -280,10 +334,11 @@ def pending_for(conn, brand, limit=None, retry_failed=False):
         LEFT JOIN {STATE_TABLE} s
                ON s.email = m.email AND s.brand = %s
         WHERE %s = ANY(m.tags)
-          AND (s.email IS NULL
-               OR m.needs_push
-               OR s.status = 'failed'
-               {"" if retry_failed else "AND s.status <> 'conflict'"})
+          AND m.duplicate_of IS NULL      -- same inbox as another record
+          -- Anyone already confirmed in Como stays untouched: we don't
+          -- re-check them, and we never overwrite their details.
+          AND (s.status IS NULL OR s.status NOT IN ('ok', 'exists'))
+          {retry}
         ORDER BY m.email
     """
     if limit:
@@ -316,6 +371,16 @@ def show_brands(conn):
             print(f"  {b:<12} {total:>8,} tagged   {done:>8,} pushed   ({state})")
 
     with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM master_customers "
+                    "WHERE duplicate_of IS NOT NULL")
+        dupes = cur.fetchone()[0]
+    if dupes:
+        print(f"\n  {dupes:,} records held back as duplicates "
+              f"(same inbox as another address).")
+        print("  psql \"$DB\" -c \"SELECT email, duplicate_of, dup_reason "
+              "FROM master_customers WHERE duplicate_of IS NOT NULL LIMIT 20;\"")
+
+    with conn.cursor() as cur:
         cur.execute(
             "SELECT count(*) FROM master_customers "
             "WHERE NOT (tags && %s)", (KNOWN_BRANDS,))
@@ -329,7 +394,8 @@ def show_brands(conn):
 
 # ── Main ─────────────────────────────────────────────────────────
 
-def run(only_brand=None, limit=None, dry_run=False, retry_failed=False):
+def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
+        update_existing=False):
     brands = configured_brands()
     if only_brand:
         only_brand = only_brand.upper()
@@ -350,7 +416,7 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False):
         if not cfg["nationality_field"] or not cfg["tag_field"]:
             print("  (Nationality/Tag fields unset - those values won't be sent)")
 
-        counts = {"ok": 0, "failed": 0, "conflict": 0}
+        counts = {"ok": 0, "exists": 0, "failed": 0, "conflict": 0}
 
         for i, row in enumerate(rows, 1):
             if dry_run:
@@ -358,16 +424,19 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False):
                 print(f"            {json.dumps(registration_data(row, cfg))}")
                 continue
 
-            status, detail = push_one(row, cfg)
-            counts[status] += 1
+            status, detail = push_one(row, cfg, update_existing=update_existing)
+            counts[status] = counts.get(status, 0) + 1
             record(conn, row["email"], name, status, detail)
 
-            marker = {"ok": " ", "failed": "!", "conflict": "?"}[status]
+            marker = {"ok": "+", "exists": "=", "failed": "!",
+                      "conflict": "?"}.get(status, " ")
             print(f"  {marker} {i:>6}/{len(rows)}  {row['email']:<38} {detail[:50]}")
             time.sleep(DELAY)
 
         if not dry_run and rows:
-            print(f"  pushed {counts['ok']}, failed {counts['failed']}, "
+            print(f"  created {counts['ok']}, "
+                  f"already there {counts.get('exists', 0)}, "
+                  f"failed {counts['failed']}, "
                   f"conflicts {counts['conflict']}")
 
     # Clear needs_push only where every brand tag has been pushed.
@@ -404,6 +473,9 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, help="only push this many per brand")
     p.add_argument("--retry-failed", action="store_true",
                    help="also retry conflicts")
+    p.add_argument("--update-existing", action="store_true",
+                   help="overwrite details of people already in Como "
+                        "(default is to leave them alone)")
     args = p.parse_args()
 
     if args.verify_auth:
@@ -417,4 +489,5 @@ if __name__ == "__main__":
         sys.exit(0)
 
     run(only_brand=args.brand, limit=args.limit,
-        dry_run=args.dry_run, retry_failed=args.retry_failed)
+        dry_run=args.dry_run, retry_failed=args.retry_failed,
+        update_existing=args.update_existing)
