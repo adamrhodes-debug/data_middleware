@@ -243,6 +243,50 @@ RETURNS TEXT[] AS $ct$
 $ct$ LANGUAGE sql IMMUTABLE;
 
 
+-- ── Minors ───────────────────────────────────────────────────────
+-- Under-18s are not held in the master table and never reach Como.
+-- They're recorded here (email only, no other details) so the same
+-- person isn't re-imported on the next run, and so you can see the
+-- number rather than wondering where records went.
+--
+-- Change MIN_AGE below if your licensing requires a different bound.
+
+CREATE TABLE IF NOT EXISTS excluded_minors (
+    email        TEXT PRIMARY KEY,
+    source_table TEXT,
+    excluded_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+CREATE OR REPLACE FUNCTION min_age()
+RETURNS INT AS $ma$ SELECT 18; $ma$ LANGUAGE sql IMMUTABLE;
+
+
+-- A birthday we can actually believe. Anything in the future, or
+-- suggesting someone over 110, is a mistyped year rather than a fact -
+-- those become NULL and the customer is kept without a birthday.
+CREATE OR REPLACE FUNCTION clean_birthday(d DATE)
+RETURNS DATE AS $cb$
+    SELECT CASE
+        WHEN d IS NULL THEN NULL
+        WHEN d > current_date THEN NULL
+        WHEN d < current_date - interval '110 years' THEN NULL
+        ELSE d
+    END;
+$cb$ LANGUAGE sql STABLE;
+
+
+-- Old enough, as far as we can tell. An unknown birthday passes -
+-- we can't prove someone is a minor from a missing field.
+CREATE OR REPLACE FUNCTION is_adult(d DATE)
+RETURNS BOOLEAN AS $ia$
+    SELECT CASE
+        WHEN clean_birthday(d) IS NULL THEN true
+        ELSE clean_birthday(d) <= current_date - (min_age() || ' years')::interval
+    END;
+$ia$ LANGUAGE sql STABLE;
+
+
 -- ── Name helper ──────────────────────────────────────────────────
 -- Source systems use placeholder text where a name is missing.
 -- Treat those as no name rather than sending them to Como as if
@@ -290,7 +334,7 @@ BEGIN
             SELECT DISTINCT ON (lower(trim(%1$s)))
                 lower(trim(%1$s)),
                 %2$s, %3$s, %4$s, %5$s,
-                clean_tags(ARRAY[%6$L] || %11$s),
+                clean_tags(ARRAY[%6$L] || %12$s),
                 %7$s,
                 ARRAY[%8$L]
             FROM %9$I
@@ -302,6 +346,8 @@ BEGIN
               AND lower(split_part(%1$s, '@', 2))
                     NOT IN (SELECT domain FROM blocked_domains)
               AND (%10$s)
+              -- Under-18s never enter the master table
+              AND (%11$s IS NULL OR is_adult(%11$s))
             ORDER BY lower(trim(%1$s))
             ON CONFLICT (email) DO UPDATE SET
                 first_name  = COALESCE(master_customers.first_name,  EXCLUDED.first_name),
@@ -326,13 +372,14 @@ BEGIN
             COALESCE('clean_name(' || m.first_name_expr || ')', 'NULL'),            -- %2
             COALESCE('clean_name(' || m.last_name_expr  || ')', 'NULL'),            -- %3
             COALESCE('nullif(trim(' || m.nationality_expr || '), '''')', 'NULL'),   -- %4
-            COALESCE(m.birthday_expr, 'NULL'),                                      -- %5
+            COALESCE('clean_birthday(' || m.birthday_expr || ')', 'NULL'),          -- %5
             m.source_tag,                                                           -- %6 first tag
             COALESCE(m.allow_email_expr, 'NULL'),                                   -- %7
             m.source_table,                                                         -- %8 label
             m.source_table,                                                         -- %9 FROM
             COALESCE(m.where_extra, 'true'),                                        -- %10
-            COALESCE(m.extra_tags_expr, 'ARRAY[]::text[]')                          -- %11
+            COALESCE(m.birthday_expr, 'NULL::date'),                                -- %11 age gate
+            COALESCE(m.extra_tags_expr, 'ARRAY[]::text[]')                          -- %12
         );
 
         EXECUTE sql;
@@ -420,6 +467,49 @@ BEGIN
     FROM master_customers;
 END;
 $sd$ LANGUAGE plpgsql;
+
+
+-- ── Record and purge minors ──────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION exclude_minors()
+RETURNS TABLE (newly_excluded BIGINT, removed_from_master BIGINT) AS $em$
+DECLARE
+    m       RECORD;
+    n_new   BIGINT := 0;
+    n_gone  BIGINT := 0;
+    sql     TEXT;
+    c       BIGINT;
+BEGIN
+    -- Note who was held back, per source, so the count is visible
+    FOR m IN
+        SELECT * FROM source_map
+        WHERE enabled AND birthday_expr IS NOT NULL
+    LOOP
+        CONTINUE WHEN to_regclass(m.source_table) IS NULL;
+
+        sql := format($f$
+            INSERT INTO excluded_minors (email, source_table)
+            SELECT DISTINCT lower(btrim(%1$s)), %2$L
+            FROM %3$I
+            WHERE %1$s IS NOT NULL
+              AND btrim(%1$s) <> ''
+              AND %4$s IS NOT NULL
+              AND NOT is_adult(%4$s)
+            ON CONFLICT (email) DO NOTHING
+        $f$, m.email_expr, m.source_table, m.source_table, m.birthday_expr);
+
+        EXECUTE sql;
+        GET DIAGNOSTICS c = ROW_COUNT;
+        n_new := n_new + c;
+    END LOOP;
+
+    -- Anyone already in the master table who shouldn't be
+    DELETE FROM master_customers WHERE NOT is_adult(birthday);
+    GET DIAGNOSTICS n_gone = ROW_COUNT;
+
+    RETURN QUERY SELECT n_new, n_gone;
+END;
+$em$ LANGUAGE plpgsql;
 
 
 -- ── Duplicate detection ──────────────────────────────────────────
@@ -535,6 +625,10 @@ HAVING count(*) > 1;
 SELECT * FROM refresh_master();
 
 \echo ''
+\echo '=== under-18s held back ==='
+SELECT * FROM exclude_minors();
+
+\echo ''
 \echo '=== splitting tags into fields ==='
 SELECT * FROM split_dimensions();
 
@@ -552,6 +646,11 @@ SELECT
     count(*) FILTER (WHERE duplicate_of IS NOT NULL) AS duplicates_held_back,
     count(*) FILTER (WHERE needs_push)          AS awaiting_push
 FROM master_customers;
+
+\echo ''
+\echo '=== minors excluded, by source ==='
+SELECT source_table, count(*) AS people
+FROM excluded_minors GROUP BY 1 ORDER BY 2 DESC;
 
 \echo ''
 \echo '=== segmentable fields ==='
