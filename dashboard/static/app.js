@@ -201,6 +201,24 @@ async function renderQuality() {
       "These customers can't be routed to a Como account. Check their source's tag settings in Registry."));
   }
   grid.append(panel("Unroutable", nb, { tight: true }));
+
+  const dup = el("div");
+  dup.append(el("div", { class: "stats" }, [
+    stat(q.duplicates, "Held back as duplicates",
+         q.duplicates > 0 ? "attention" : "good"),
+  ]));
+  if (q.duplicates > 0) {
+    dup.append(table(
+      [{ label: "Address" }, { label: "Same inbox as" }],
+      q.duplicate_sample,
+      r => el("tr", {}, [
+        el("td", {}, r.email),
+        el("td", {}, r.duplicate_of),
+      ])));
+    dup.append(el("div", { class: "note" },
+      "These reach the same inbox as another record (Gmail ignores dots and anything after a +). Only one of each set is pushed to Como."));
+  }
+  grid.append(panel("Duplicates", dup, { tight: true }));
 }
 
 /* ── Consent ────────────────────────────────────────────────── */
@@ -291,6 +309,81 @@ async function renderPush() {
     ...p.brands.map(b => el("a", { href: `/export.csv?brand=${b.brand}` },
        el("button", { class: "action quiet" }, b.brand))),
   ]);
+  // ── Pre-flight: prove nothing dodgy is queued ──────────────────
+  const pf = await get("/api/preflight");
+  const pfBody = el("div");
+
+  pfBody.append(el("div", { class: "stats" }, [
+    stat(pf.queued, "Queued to push"),
+    el("div", { class: "stat" }, [
+      el("div", {
+        class: "stat-value " + (pf.all_clear ? "good" : "attention"),
+        style: "font-size:18px",
+      }, pf.all_clear ? "All clear" : "Needs a look"),
+      el("div", { class: "label" }, "Safety checks"),
+    ]),
+  ]));
+
+  pfBody.append(table(
+    [{ label: "Check" }, { label: "Result" }, { label: "Affected", num: true }],
+    pf.checks,
+    c => el("tr", {}, [
+      el("td", {}, [
+        el("div", {}, c.name),
+        el("div", { class: "label", style: "text-transform:none;letter-spacing:0" },
+           c.detail),
+      ]),
+      el("td", {}, [el("span", { class: "pill " + (c.pass ? "ok" : "conflict") },
+                        c.pass ? "pass" : "check")]),
+      el("td", { class: "num" }, num(c.count)),
+    ])));
+
+  const failed = pf.checks.filter(c => !c.pass);
+  if (failed.length) {
+    failed.forEach(c => {
+      pfBody.append(el("div", { class: "note" },
+        c.name + " — examples: " +
+        c.sample.map(x => x.email || x.emails?.join(" / ") || "").join(", ")));
+    });
+  }
+
+  host.append(el("div", { style: "margin-top:20px" },
+    panel("Before you push", pfBody, { tight: true })));
+
+  // ── Test push: one person ──────────────────────────────────────
+  const testEmail = el("input", { type: "text",
+    placeholder: "someone@example.com", style: "min-width:260px" });
+  const testOut = el("pre", { class: "output" },
+    "Pushes one person and shows what Como stores afterwards.");
+  let testPoll = null;
+
+  const runTest = async (dryRun) => {
+    const email = testEmail.value.trim();
+    if (!email) return;
+    testOut.textContent = "Working…";
+    const { run_id, error } = await post("/api/testpush", { email, dry_run: dryRun });
+    if (error) { testOut.textContent = error; return; }
+    if (testPoll) clearInterval(testPoll);
+    testPoll = setInterval(async () => {
+      const r = await get(`/api/run/${run_id}/output`);
+      testOut.textContent = r.output || "…";
+      testOut.scrollTop = testOut.scrollHeight;
+      if (r.status !== "running") clearInterval(testPoll);
+    }, 1000);
+  };
+
+  host.append(el("div", { style: "margin-top:20px" },
+    panel("Test with one person", el("div", {}, [
+      el("div", { class: "row", style: "margin-bottom:12px" }, [
+        testEmail,
+        el("button", { class: "action quiet",
+                       onclick: () => runTest(true) }, "Preview only"),
+        el("button", { class: "action",
+                       onclick: () => runTest(false) }, "Push this one"),
+      ]),
+      testOut,
+    ]))));
+
   const wrap = el("div", { style: "margin-top:20px" }, [panel("Export", exp)]);
   host.append(wrap);
 }

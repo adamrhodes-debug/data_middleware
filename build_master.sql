@@ -66,6 +66,70 @@ CREATE TABLE IF NOT EXISTS source_map (
 );
 
 
+-- ── Mistyped domains ─────────────────────────────────────────────
+-- People fat-finger their email at the till or on a phone keyboard.
+-- gmail.con, gmial.com and gamil.vom don't exist, so those addresses
+-- hard-bounce - and enough bounces damage your sending reputation for
+-- everyone else. Correcting them recovers real customers.
+--
+-- Only put unambiguous typos here. If there's any chance a domain is
+-- real, leave it alone.
+
+CREATE TABLE IF NOT EXISTS domain_corrections (
+    wrong   TEXT PRIMARY KEY,
+    correct TEXT NOT NULL
+);
+
+INSERT INTO domain_corrections (wrong, correct) VALUES
+    -- gmail
+    ('gmial.com', 'gmail.com'),   ('gmai.com', 'gmail.com'),
+    ('gmail.con', 'gmail.com'),   ('gmail.co', 'gmail.com'),
+    ('gmail.cm', 'gmail.com'),    ('gmail.om', 'gmail.com'),
+    ('gamil.com', 'gmail.com'),   ('gamil.vom', 'gmail.com'),
+    ('gmaill.com', 'gmail.com'),  ('gmail.comm', 'gmail.com'),
+    ('gmali.com', 'gmail.com'),   ('gmail.co.m', 'gmail.com'),
+    ('3gmail.com', 'gmail.com'),  ('gmial.co', 'gmail.com'),
+    ('gmaul.com', 'gmail.com'),   ('gmeil.com', 'gmail.com'),
+    ('gmail.cin', 'gmail.com'),   ('gmail.vom', 'gmail.com'),
+    ('gnail.com', 'gmail.com'),   ('ymail.con', 'ymail.com'),
+    -- hotmail
+    ('hotmial.com', 'hotmail.com'), ('hotmail.con', 'hotmail.com'),
+    ('hotmail.co', 'hotmail.com'),  ('hotmai.com', 'hotmail.com'),
+    ('hotmail.vom', 'hotmail.com'), ('hotmall.com', 'hotmail.com'),
+    ('homail.com', 'hotmail.com'),  ('hotmaill.com', 'hotmail.com'),
+    -- yahoo
+    ('yaho.com', 'yahoo.com'),      ('yahoo.con', 'yahoo.com'),
+    ('yahooo.com', 'yahoo.com'),    ('yahoo.co', 'yahoo.com'),
+    ('yahoo.vom', 'yahoo.com'),
+    -- outlook / icloud / live
+    ('outlok.com', 'outlook.com'),  ('outlook.con', 'outlook.com'),
+    ('outlook.co', 'outlook.com'),  ('icloud.con', 'icloud.com'),
+    ('iclould.com', 'icloud.com'),  ('icloud.co', 'icloud.com'),
+    ('live.con', 'live.com')
+ON CONFLICT (wrong) DO NOTHING;
+
+
+CREATE OR REPLACE FUNCTION fix_domain(e TEXT)
+RETURNS TEXT AS $fx$
+DECLARE
+    local  TEXT;
+    domain TEXT;
+    fixed  TEXT;
+BEGIN
+    IF e IS NULL OR position('@' in e) = 0 THEN
+        RETURN e;
+    END IF;
+
+    local  := split_part(lower(btrim(e)), '@', 1);
+    domain := split_part(lower(btrim(e)), '@', 2);
+
+    SELECT correct INTO fixed FROM domain_corrections WHERE wrong = domain;
+
+    RETURN local || '@' || COALESCE(fixed, domain);
+END;
+$fx$ LANGUAGE plpgsql STABLE;
+
+
 -- ── Domains never allowed into the master table ──────────────────
 
 CREATE TABLE IF NOT EXISTS blocked_domains (
@@ -248,7 +312,7 @@ BEGIN
                OR master_customers.allow_email IS NULL AND EXCLUDED.allow_email IS NOT NULL
                OR NOT (EXCLUDED.sources <@ master_customers.sources)
         $f$,
-            m.email_expr,                                                          -- %1
+            'fix_domain(' || m.email_expr || ')',                                  -- %1
             COALESCE('clean_name(' || m.first_name_expr || ')', 'NULL'),            -- %2
             COALESCE('clean_name(' || m.last_name_expr  || ')', 'NULL'),            -- %3
             COALESCE('nullif(trim(' || m.nationality_expr || '), '''')', 'NULL'),   -- %4
@@ -443,6 +507,13 @@ SELECT
 FROM master_customers;
 
 \echo ''
+\echo '=== mistyped domains corrected on the way in ==='
+SELECT dc.wrong || ' -> ' || dc.correct AS correction, count(*) AS records
+FROM domain_corrections dc
+JOIN wifi_guests w ON lower(split_part(w.email, '@', 2)) = dc.wrong
+GROUP BY 1 ORDER BY 2 DESC LIMIT 15;
+
+\echo ''
 \echo '=== same name, different address (review these yourself) ==='
 SELECT * FROM possible_duplicates ORDER BY records DESC LIMIT 20;
 
@@ -453,8 +524,20 @@ FROM master_customers
 LIMIT 5;
 
 
--- Keep the dashboard's read-only user working after a rebuild
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard;
+-- Keep the dashboard's read-only user working after a rebuild.
+-- Only tables this role owns - dashboard_runs belongs to postgres.
+DO $grant$
+DECLARE t RECORD;
+BEGIN
+    FOR t IN SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public' AND tableowner = current_user
+    LOOP
+        EXECUTE format('GRANT SELECT ON %I TO dashboard', t.tablename);
+    END LOOP;
+EXCEPTION WHEN undefined_object THEN
+    NULL;   -- dashboard role doesn't exist, fine
+END
+$grant$;
 
 
 -- =================================================================

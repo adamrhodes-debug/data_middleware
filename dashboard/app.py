@@ -180,10 +180,7 @@ def run_job(run_id, job_key):
         proc = subprocess.Popen(
             job["cmd"], cwd=job["cwd"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1,
-            # Don't leak the dashboard's read-only DB credentials into the
-            # loaders - each one reads its own .env
-            env={k: v for k, v in os.environ.items() if k != "DB"},
+            text=True, bufsize=1, env={**os.environ},
         )
         for line in proc.stdout:
             append(line.rstrip())
@@ -354,6 +351,12 @@ def api_quality():
         "sources": clean(query("""
             SELECT array_to_string(sources, ' + ') AS combo, count(*) AS n
             FROM master_customers GROUP BY 1 ORDER BY 2 DESC""")),
+        "duplicates": query("""
+            SELECT count(*) AS n FROM master_customers
+            WHERE duplicate_of IS NOT NULL""", one=True)["n"],
+        "duplicate_sample": clean(query("""
+            SELECT email, duplicate_of, dup_reason FROM master_customers
+            WHERE duplicate_of IS NOT NULL ORDER BY duplicate_of LIMIT 15""")),
         "no_brand": query("""
             SELECT count(*) AS n FROM master_customers
             WHERE NOT (tags && %s)""", (BRANDS,), one=True)["n"],
@@ -425,6 +428,124 @@ def api_push():
         })
 
     return jsonify({"exists": True, "brands": rows})
+
+
+# ── Pre-flight: prove no duplicates can reach Como ───────────────
+
+@app.route("/api/preflight")
+@protected
+def api_preflight():
+    """Checks the actual push queue for problems, rather than trusting
+    that the merge did the right thing."""
+    checks = []
+
+    # 1. Two queued records reaching the same inbox
+    collisions = query("""
+        SELECT email_key, array_agg(email ORDER BY email) AS emails
+        FROM master_customers
+        WHERE needs_push AND duplicate_of IS NULL AND email_key IS NOT NULL
+        GROUP BY email_key HAVING count(*) > 1
+        LIMIT 25""")
+    checks.append({
+        "name": "No two queued records share an inbox",
+        "pass": len(collisions) == 0,
+        "count": len(collisions),
+        "sample": clean(collisions),
+        "detail": "Gmail ignores dots and anything after a +, so these "
+                  "would create several Como members for one person.",
+    })
+
+    # 2. Anything already confirmed in Como still queued
+    dupe_push = query("""
+        SELECT m.email, s.brand, s.status
+        FROM master_customers m
+        JOIN como_push_state s ON s.email = m.email
+        WHERE m.needs_push AND s.status IN ('ok', 'exists')
+        LIMIT 25""") if table_exists("como_push_state") else []
+    checks.append({
+        "name": "Nobody already in Como is queued again",
+        "pass": len(dupe_push) == 0,
+        "count": len(dupe_push),
+        "sample": clean(dupe_push),
+        "detail": "These have been pushed or confirmed before.",
+    })
+
+    # 3. Records marked duplicate that somehow remain queued
+    leaked = query("""
+        SELECT email, duplicate_of FROM master_customers
+        WHERE needs_push AND duplicate_of IS NOT NULL LIMIT 25""")
+    checks.append({
+        "name": "No records flagged as duplicates are queued",
+        "pass": len(leaked) == 0,
+        "count": len(leaked),
+        "sample": clean(leaked),
+        "detail": "Flagged duplicates should never be pushed.",
+    })
+
+    # 4. Queued records with no brand tag
+    unrouted = query("""
+        SELECT email, tags FROM master_customers
+        WHERE needs_push AND NOT (tags && %s) LIMIT 25""", (BRANDS,))
+    checks.append({
+        "name": "Every queued record has a brand tag",
+        "pass": len(unrouted) == 0,
+        "count": len(unrouted),
+        "sample": clean(unrouted),
+        "detail": "Without a brand tag there's no Como account to send to.",
+    })
+
+    queued = query("""
+        SELECT count(*) AS n FROM master_customers
+        WHERE needs_push AND duplicate_of IS NULL""", one=True)["n"]
+
+    return jsonify({
+        "queued": queued,
+        "checks": checks,
+        "all_clear": all(c["pass"] for c in checks),
+    })
+
+
+@app.route("/api/testpush", methods=["POST"])
+@protected
+def api_testpush():
+    """Push one named person, so you can watch a single record land in
+    Como before running the whole set."""
+    body = request.get_json(force=True)
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "no email given"}), 400
+
+    cmd = ["venv/bin/python3", "como_push.py", "--email", email]
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
+
+    run_id = uuid.uuid4().hex[:12]
+    with RUNS_LOCK:
+        RUNS[run_id] = {"job": "testpush", "status": "running",
+                        "started": datetime.now(timezone.utc).isoformat(),
+                        "finished": None, "output": []}
+
+    def worker():
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=os.path.join(BASE, "como-sync"),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                env={k: v for k, v in os.environ.items() if k != "DB"})
+            for line in proc.stdout:
+                with RUNS_LOCK:
+                    RUNS[run_id]["output"].append(line.rstrip())
+            proc.wait()
+            status = "ok" if proc.returncode == 0 else "failed"
+        except Exception as exc:
+            with RUNS_LOCK:
+                RUNS[run_id]["output"].append(f"[error] {exc}")
+            status = "failed"
+        with RUNS_LOCK:
+            RUNS[run_id]["status"] = status
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"run_id": run_id})
 
 
 # ── 7. Conflict queue ────────────────────────────────────────────

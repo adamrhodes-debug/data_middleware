@@ -394,6 +394,66 @@ def show_brands(conn):
 
 # ── Main ─────────────────────────────────────────────────────────
 
+def push_single(email, only_brand=None, dry_run=False):
+    """Push one named person. Ignores whether they've been pushed
+    before, so it's usable as a live test."""
+    email = email.strip().lower()
+    brands = configured_brands()
+
+    conn = psycopg2.connect(DB)
+    ensure_state_table(conn)
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM master_customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+    if not row:
+        print(f"{email} isn't in master_customers.")
+        conn.close()
+        return False
+
+    if row["duplicate_of"]:
+        print(f"NOTE: this address shares an inbox with {row['duplicate_of']},")
+        print("      which is the record normally pushed.")
+
+    targets = [b for b in brands if b in (row["tags"] or [])]
+    if only_brand:
+        targets = [b for b in targets if b == only_brand.upper()]
+
+    if not targets:
+        print(f"{email} carries tags {row['tags']} - no configured brand "
+              f"among them, so there's nowhere to push it.")
+        conn.close()
+        return False
+
+    for name in targets:
+        cfg = brands[name]
+        print(f"\n--- {name} ---")
+        print(f"  would send: {json.dumps(registration_data(row, cfg))}")
+
+        if dry_run:
+            continue
+
+        exists = member_exists(cfg, email)
+        print(f"  already in Como: {exists}")
+
+        status, detail = push_one(row, cfg)
+        record(conn, email, name, status, detail)
+        print(f"  result: {status} - {detail}")
+
+        # Read the member back so you can see exactly what Como stored
+        try:
+            _, body = call(cfg, "getMemberDetails",
+                           {"customer": {"email": email}}, advanced=False)
+            print("  Como now holds:")
+            print(json.dumps(body, indent=2)[:1500])
+        except requests.RequestException as exc:
+            print(f"  (couldn't read back: {exc})")
+
+    conn.close()
+    return True
+
+
 def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
         update_existing=False):
     brands = configured_brands()
@@ -473,6 +533,9 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, help="only push this many per brand")
     p.add_argument("--retry-failed", action="store_true",
                    help="also retry conflicts")
+    p.add_argument("--email",
+                   help="push just this one person, and show what Como "
+                        "stores afterwards - useful as a live test")
     p.add_argument("--update-existing", action="store_true",
                    help="overwrite details of people already in Como "
                         "(default is to leave them alone)")
@@ -487,6 +550,10 @@ if __name__ == "__main__":
         show_brands(c)
         c.close()
         sys.exit(0)
+
+    if args.email:
+        sys.exit(0 if push_single(args.email, only_brand=args.brand,
+                                  dry_run=args.dry_run) else 1)
 
     run(only_brand=args.brand, limit=args.limit,
         dry_run=args.dry_run, retry_failed=args.retry_failed,
