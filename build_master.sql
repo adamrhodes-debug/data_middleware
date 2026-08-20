@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS master_customers (
                                         --   first element is always the source
     allow_email     BOOLEAN,            -- AllowEmail (NULL = unknown)
 
+    -- Duplicate detection (see find_duplicates() below)
+    email_key       TEXT,               -- normalised email used for matching
+    duplicate_of    TEXT,               -- the email we treat as this person's record
+    dup_reason      TEXT,
+
     -- Housekeeping for the push
     sources         TEXT[],
     needs_push      BOOLEAN NOT NULL DEFAULT true,
@@ -33,6 +38,9 @@ CREATE TABLE IF NOT EXISTS master_customers (
 
 CREATE INDEX IF NOT EXISTS master_needs_push_idx
     ON master_customers (needs_push) WHERE needs_push;
+CREATE INDEX IF NOT EXISTS master_email_key_idx ON master_customers (email_key);
+CREATE INDEX IF NOT EXISTS master_duplicate_idx
+    ON master_customers (duplicate_of) WHERE duplicate_of IS NOT NULL;
 
 
 -- ── The registry: which tables feed the master, and how ──────────
@@ -307,11 +315,121 @@ INSERT INTO source_map (
 ON CONFLICT (source_table) DO NOTHING;
 
 
+-- ── Duplicate detection ──────────────────────────────────────────
+-- master_customers is keyed on email, so identical addresses can't
+-- both be present. What we're looking for is the SAME PERSON under
+-- DIFFERENT addresses.
+--
+-- Gmail treats dots as insignificant and ignores anything after a
+-- "+", so all of these reach one inbox:
+--     j.o.h.n@gmail.com
+--     john+shopping@gmail.com
+--     john@googlemail.com
+-- Pushing all three to Como creates three members for one person and
+-- emails them three times.
+
+CREATE OR REPLACE FUNCTION normalise_email(e TEXT)
+RETURNS TEXT AS $ne$
+DECLARE
+    local  TEXT;
+    domain TEXT;
+BEGIN
+    IF e IS NULL OR position('@' in e) = 0 THEN
+        RETURN NULL;
+    END IF;
+
+    local  := lower(split_part(e, '@', 1));
+    domain := lower(split_part(e, '@', 2));
+
+    -- Anything after + is a user-chosen label, not part of the address
+    local := split_part(local, '+', 1);
+
+    -- Gmail (and googlemail) ignore dots entirely
+    IF domain IN ('gmail.com', 'googlemail.com') THEN
+        local  := replace(local, '.', '');
+        domain := 'gmail.com';
+    END IF;
+
+    RETURN local || '@' || domain;
+END;
+$ne$ LANGUAGE plpgsql IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION find_duplicates()
+RETURNS TABLE (duplicates BIGINT, people_affected BIGINT) AS $fd$
+BEGIN
+    -- Start clean so a rebuild re-evaluates everything
+    UPDATE master_customers
+    SET email_key = normalise_email(email),
+        duplicate_of = NULL,
+        dup_reason = NULL;
+
+    -- Within each group sharing a normalised address, keep one record
+    -- and point the others at it. The keeper is the one with the most
+    -- complete data, then the shortest address, then alphabetical - so
+    -- the choice is stable between runs.
+    WITH ranked AS (
+        SELECT email, email_key,
+               row_number() OVER (
+                   PARTITION BY email_key
+                   ORDER BY (first_name IS NOT NULL)::int
+                          + (last_name IS NOT NULL)::int
+                          + (birthday IS NOT NULL)::int DESC,
+                            length(email),
+                            email
+               ) AS rn,
+               first_value(email) OVER (
+                   PARTITION BY email_key
+                   ORDER BY (first_name IS NOT NULL)::int
+                          + (last_name IS NOT NULL)::int
+                          + (birthday IS NOT NULL)::int DESC,
+                            length(email),
+                            email
+               ) AS keeper
+        FROM master_customers
+        WHERE email_key IS NOT NULL
+    )
+    UPDATE master_customers m
+    SET duplicate_of = r.keeper,
+        dup_reason   = 'same inbox as ' || r.keeper,
+        needs_push   = false
+    FROM ranked r
+    WHERE m.email = r.email AND r.rn > 1;
+
+    RETURN QUERY
+    SELECT count(*) FILTER (WHERE duplicate_of IS NOT NULL),
+           count(DISTINCT email_key) FILTER (WHERE duplicate_of IS NOT NULL)
+    FROM master_customers;
+END;
+$fd$ LANGUAGE plpgsql;
+
+
+-- Same person under unrelated addresses - can't be resolved
+-- automatically without risking merging two real people, so this only
+-- reports. Review before acting on it.
+CREATE OR REPLACE VIEW possible_duplicates AS
+SELECT lower(btrim(first_name)) AS first_name,
+       lower(btrim(last_name))  AS last_name,
+       birthday,
+       count(*)                 AS records,
+       array_agg(email ORDER BY email) AS emails
+FROM master_customers
+WHERE duplicate_of IS NULL
+  AND first_name IS NOT NULL
+  AND last_name IS NOT NULL
+GROUP BY 1, 2, 3
+HAVING count(*) > 1;
+
+
 -- ── Run it ───────────────────────────────────────────────────────
 
 \echo ''
 \echo '=== merging sources (-1 means table not found) ==='
 SELECT * FROM refresh_master();
+
+\echo ''
+\echo '=== duplicate check ==='
+SELECT * FROM find_duplicates();
 
 \echo ''
 \echo '=== master_customers ==='
@@ -320,14 +438,23 @@ SELECT
     count(*) FILTER (WHERE allow_email)         AS consented,
     count(*) FILTER (WHERE allow_email IS NULL) AS consent_unknown,
     count(*) FILTER (WHERE allow_email = false) AS opted_out,
+    count(*) FILTER (WHERE duplicate_of IS NOT NULL) AS duplicates_held_back,
     count(*) FILTER (WHERE needs_push)          AS awaiting_push
 FROM master_customers;
+
+\echo ''
+\echo '=== same name, different address (review these yourself) ==='
+SELECT * FROM possible_duplicates ORDER BY records DESC LIMIT 20;
 
 \echo ''
 \echo '=== sample tags (Como wants these as a JSON array) ==='
 SELECT email, tags, to_jsonb(tags) AS como_format
 FROM master_customers
 LIMIT 5;
+
+
+-- Keep the dashboard's read-only user working after a rebuild
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard;
 
 
 -- =================================================================
