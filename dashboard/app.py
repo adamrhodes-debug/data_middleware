@@ -505,6 +505,126 @@ def api_preflight():
     })
 
 
+@app.route("/api/mainpush", methods=["POST"])
+@protected
+def api_mainpush():
+    """Start the full push, paced. Runs in the background so the page
+    can poll for output."""
+    body = request.get_json(force=True)
+
+    cmd = ["venv/bin/python3", "como_push.py"]
+
+    brand = (body.get("brand") or "").strip().upper()
+    if brand and brand != "ALL":
+        cmd += ["--brand", brand]
+
+    if body.get("limit"):
+        cmd += ["--limit", str(int(body["limit"]))]
+
+    batch = int(body.get("batch_size") or 0)
+    pause = int(body.get("batch_pause") or 0)
+    if batch and pause:
+        cmd += ["--batch-size", str(batch), "--batch-pause", str(pause)]
+
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
+
+    run_id = uuid.uuid4().hex[:12]
+    with RUNS_LOCK:
+        RUNS[run_id] = {"job": "push", "status": "running",
+                        "started": datetime.now(timezone.utc).isoformat(),
+                        "finished": None, "output": []}
+
+    ensure_runs_table()
+    execute("INSERT INTO dashboard_runs (id, job, status) VALUES (%s,'push','running')",
+            (run_id,))
+
+    def worker():
+        lines = []
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=os.path.join(BASE, "como-sync"),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                env={k: v for k, v in os.environ.items() if k != "DB"})
+            for line in proc.stdout:
+                with RUNS_LOCK:
+                    RUNS[run_id]["output"].append(line.rstrip())
+                lines.append(line.rstrip())
+            proc.wait()
+            status = "ok" if proc.returncode == 0 else "failed"
+        except Exception as exc:
+            with RUNS_LOCK:
+                RUNS[run_id]["output"].append(f"[error] {exc}")
+            status = "failed"
+
+        with RUNS_LOCK:
+            RUNS[run_id]["status"] = status
+            RUNS[run_id]["finished"] = datetime.now(timezone.utc).isoformat()
+        try:
+            execute("""UPDATE dashboard_runs SET finished_at = now(),
+                       status = %s, output = %s WHERE id = %s""",
+                    (status, "\n".join(lines)[-40000:], run_id))
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"run_id": run_id, "command": " ".join(cmd)})
+
+
+@app.route("/api/pushplan")
+@protected
+def api_pushplan():
+    """How long a paced run would take, given what's actually queued."""
+    brand = (request.args.get("brand") or "ALL").upper()
+    batch = int(request.args.get("batch_size") or 0)
+    pause = int(request.args.get("batch_pause") or 0)
+
+    if brand == "ALL":
+        queued = query("""
+            SELECT count(*) AS n FROM master_customers m
+            WHERE m.duplicate_of IS NULL
+              AND m.tags && %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM como_push_state s
+                  WHERE s.email = m.email AND s.status IN ('ok','exists'))
+            """, (BRANDS,), one=True)["n"] if table_exists("como_push_state") else 0
+    else:
+        queued = query("""
+            SELECT count(*) AS n FROM master_customers m
+            WHERE m.duplicate_of IS NULL
+              AND %s = ANY(m.tags)
+              AND NOT EXISTS (
+                  SELECT 1 FROM como_push_state s
+                  WHERE s.email = m.email AND s.status IN ('ok','exists'))
+            """, (brand,), one=True)["n"] if table_exists("como_push_state") else 0
+
+    per_record = float(os.environ.get("COMO_REQUEST_DELAY_SECONDS", "0.5"))
+    # roughly one existence check, plus a create for people not there yet
+    calls = int(queued * 1.5)
+    seconds = queued * per_record * 1.5
+    batches = 0
+    if batch and pause and queued:
+        batches = (queued + batch - 1) // batch
+        seconds += (batches - 1) * pause
+
+    return jsonify({
+        "queued": queued,
+        "api_calls": calls,
+        "batches": batches,
+        "seconds": int(seconds),
+        "human": _human_time(seconds),
+    })
+
+
+def _human_time(seconds):
+    if seconds < 60:
+        return f"{int(seconds)} sec"
+    if seconds < 3600:
+        return f"{seconds/60:.0f} min"
+    return f"{seconds/3600:.1f} hours"
+
+
 @app.route("/api/testpush", methods=["POST"])
 @protected
 def api_testpush():

@@ -350,6 +350,96 @@ async function renderPush() {
   host.append(el("div", { style: "margin-top:20px" },
     panel("Before you push", pfBody, { tight: true })));
 
+  // ── Main push, paced ───────────────────────────────────────────
+  const brandSel = el("select", {}, [
+    el("option", { value: "ALL" }, "All configured brands"),
+    ...p.brands.filter(b => b.configured)
+              .map(b => el("option", { value: b.brand }, b.brand)),
+  ]);
+  const batchIn = el("input", { type: "text", value: "50", style: "width:70px" });
+  const pauseIn = el("input", { type: "text", value: "120", style: "width:70px" });
+  const limitIn = el("input", { type: "text", placeholder: "all",
+                                style: "width:70px" });
+  const estimate = el("div", { class: "note", style: "border:none;padding:8px 0" },
+                      "…");
+  const pushOut = el("pre", { class: "output" },
+    "Nothing running. Preview first, then start.");
+  const startBtn = el("button", { class: "action" }, "Start push");
+  const previewBtn = el("button", { class: "action quiet" }, "Preview");
+  let pushPoll = null;
+
+  const refreshEstimate = async () => {
+    const q = new URLSearchParams({
+      brand: brandSel.value,
+      batch_size: batchIn.value || 0,
+      batch_pause: pauseIn.value || 0,
+    });
+    try {
+      const e = await get("/api/pushplan?" + q);
+      estimate.textContent =
+        `${num(e.queued)} queued · about ${num(e.api_calls)} API calls · ` +
+        (e.batches ? `${num(e.batches)} batches · ` : "") +
+        `roughly ${e.human}`;
+    } catch (err) {
+      estimate.textContent = "Couldn't work out an estimate.";
+    }
+  };
+
+  [brandSel, batchIn, pauseIn].forEach(i =>
+    i.addEventListener("change", refreshEstimate));
+  refreshEstimate();
+
+  const startPush = async (dryRun) => {
+    if (!dryRun) {
+      const e = estimate.textContent;
+      if (!confirm(`This sends real data to Como.\n\n${e}\n\nGo ahead?`)) return;
+    }
+    startBtn.disabled = previewBtn.disabled = true;
+    pushOut.textContent = "Starting…";
+    const { run_id, command } = await post("/api/mainpush", {
+      brand: brandSel.value,
+      batch_size: batchIn.value,
+      batch_pause: pauseIn.value,
+      limit: limitIn.value || null,
+      dry_run: dryRun,
+    });
+    pushOut.textContent = "$ " + command + "\n";
+    if (pushPoll) clearInterval(pushPoll);
+    pushPoll = setInterval(async () => {
+      const r = await get(`/api/run/${run_id}/output`);
+      pushOut.textContent = "$ " + command + "\n\n" + (r.output || "…");
+      pushOut.scrollTop = pushOut.scrollHeight;
+      if (r.status !== "running") {
+        clearInterval(pushPoll);
+        startBtn.disabled = previewBtn.disabled = false;
+        drawPipeline();
+        refreshEstimate();
+      }
+    }, 2000);
+  };
+
+  startBtn.addEventListener("click", () => startPush(false));
+  previewBtn.addEventListener("click", () => startPush(true));
+
+  host.append(el("div", { style: "margin-top:20px" },
+    panel("Push to Como", el("div", {}, [
+      el("div", { class: "row", style: "margin-bottom:10px" }, [
+        el("span", { class: "label" }, "Brand"), brandSel,
+        el("span", { class: "label" }, "Batch of"), batchIn,
+        el("span", { class: "label" }, "then wait (sec)"), pauseIn,
+        el("span", { class: "label" }, "Cap at"), limitIn,
+      ]),
+      estimate,
+      el("div", { class: "row", style: "margin-bottom:12px" },
+         [previewBtn, startBtn]),
+      pushOut,
+      el("div", { class: "note" },
+        "Pacing doesn't reduce the number of API calls, only the rate. " +
+        "Como's fair usage policy warns about sustained sequential access " +
+        "on one key, so keep the rate modest and tell your account manager " +
+        "before a large backfill. The run keeps going if you close this tab."),
+    ]))));
+
   // ── Test push: one person ──────────────────────────────────────
   const testEmail = el("input", { type: "text",
     placeholder: "someone@example.com", style: "min-width:260px" });

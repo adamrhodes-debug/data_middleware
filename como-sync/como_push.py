@@ -494,7 +494,7 @@ def push_single(email, only_brand=None, dry_run=False):
 
 
 def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
-        update_existing=False):
+        update_existing=False, batch_size=None, batch_pause=0):
     brands = configured_brands()
     if only_brand:
         only_brand = only_brand.upper()
@@ -519,6 +519,13 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
 
         counts = {"ok": 0, "exists": 0, "failed": 0, "conflict": 0}
 
+        if batch_size and batch_pause and not dry_run:
+            batches = (len(rows) + batch_size - 1) // batch_size
+            mins = (batches - 1) * batch_pause / 60
+            print(f"  pacing: {batch_size} at a time, {batch_pause}s between "
+                  f"batches - about {mins:.0f} min of waiting across "
+                  f"{batches} batches")
+
         for i, row in enumerate(rows, 1):
             if dry_run:
                 print(f"  [dry-run] {row['email']}")
@@ -533,8 +540,20 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
 
             marker = {"ok": "+", "exists": "=", "failed": "!",
                       "conflict": "?"}.get(status, " ")
-            print(f"  {marker} {i:>6}/{len(rows)}  {row['email']:<38} {detail[:50]}")
+            print(f"  {marker} {i:>6}/{len(rows)}  {row['email']:<38} {detail[:50]}", flush=True)
             time.sleep(DELAY)
+
+            # Pause between batches. Spreading the run out doesn't reduce
+            # the total number of calls, but it keeps the rate low enough
+            # not to look like the "volume spike" Como's fair usage
+            # policy warns about.
+            if batch_size and batch_pause and i % batch_size == 0 and i < len(rows):
+                done = counts["ok"] + counts["exists"]
+                left = (len(rows) - i) / batch_size * batch_pause / 60
+                print(f"  -- batch done ({i}/{len(rows)}, {done} settled). "
+                      f"waiting {batch_pause}s, ~{left:.0f} min remaining --",
+                      flush=True)
+                time.sleep(batch_pause)
 
         if not dry_run and rows:
             print(f"  created {counts['ok']}, "
@@ -576,6 +595,10 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, help="only push this many per brand")
     p.add_argument("--retry-failed", action="store_true",
                    help="also retry conflicts")
+    p.add_argument("--batch-size", type=int,
+                   help="push this many, then pause (use with --batch-pause)")
+    p.add_argument("--batch-pause", type=int, default=0,
+                   help="seconds to wait between batches")
     p.add_argument("--email",
                    help="push just this one person, and show what Como "
                         "stores afterwards - useful as a live test")
@@ -600,4 +623,5 @@ if __name__ == "__main__":
 
     run(only_brand=args.brand, limit=args.limit,
         dry_run=args.dry_run, retry_failed=args.retry_failed,
-        update_existing=args.update_existing)
+        update_existing=args.update_existing,
+        batch_size=args.batch_size, batch_pause=args.batch_pause)
