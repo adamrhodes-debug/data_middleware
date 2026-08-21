@@ -595,6 +595,8 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, help="only push this many per brand")
     p.add_argument("--retry-failed", action="store_true",
                    help="also retry conflicts")
+    p.add_argument("--rate", type=int,
+                   help="calls per minute (Como's limit is 500)")
     p.add_argument("--batch-size", type=int,
                    help="push this many, then pause (use with --batch-pause)")
     p.add_argument("--batch-pause", type=int, default=0,
@@ -606,6 +608,11 @@ if __name__ == "__main__":
                    help="overwrite details of people already in Como "
                         "(default is to leave them alone)")
     args = p.parse_args()
+
+    if args.rate:
+        # Como allows 500 calls/minute. Convert to a per-call delay.
+        globals()["DELAY"] = 60.0 / max(args.rate, 1)
+        print(f"Rate: {args.rate} calls/min ({DELAY:.2f}s between calls)")
 
     if args.verify_auth:
         sys.exit(0 if verify_auth() else 1)

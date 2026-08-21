@@ -356,8 +356,11 @@ async function renderPush() {
     ...p.brands.filter(b => b.configured)
               .map(b => el("option", { value: b.brand }, b.brand)),
   ]);
-  const batchIn = el("input", { type: "text", value: "50", style: "width:70px" });
-  const pauseIn = el("input", { type: "text", value: "120", style: "width:70px" });
+  const rateIn = el("input", { type: "text", value: "300", style: "width:70px" });
+  const batchIn = el("input", { type: "text", placeholder: "off",
+                                style: "width:70px" });
+  const pauseIn = el("input", { type: "text", placeholder: "off",
+                                style: "width:70px" });
   const limitIn = el("input", { type: "text", placeholder: "all",
                                 style: "width:70px" });
   const estimate = el("div", { class: "note", style: "border:none;padding:8px 0" },
@@ -371,6 +374,7 @@ async function renderPush() {
   const refreshEstimate = async () => {
     const q = new URLSearchParams({
       brand: brandSel.value,
+      rate: rateIn.value || 0,
       batch_size: batchIn.value || 0,
       batch_pause: pauseIn.value || 0,
     });
@@ -380,13 +384,19 @@ async function renderPush() {
         `${num(e.queued)} queued · about ${num(e.api_calls)} API calls · ` +
         (e.batches ? `${num(e.batches)} batches · ` : "") +
         `roughly ${e.human}`;
+      estimate.style.color = e.over_limit ? "var(--fail)" : "";
+      if (e.over_limit) {
+        estimate.textContent += "  ⚠ above Como's 500/min limit";
+      }
     } catch (err) {
       estimate.textContent = "Couldn't work out an estimate.";
     }
   };
 
-  [brandSel, batchIn, pauseIn].forEach(i =>
-    i.addEventListener("change", refreshEstimate));
+  [brandSel, rateIn, batchIn, pauseIn].forEach(i => {
+    i.addEventListener("change", refreshEstimate);
+    i.addEventListener("keyup", refreshEstimate);
+  });
   refreshEstimate();
 
   const startPush = async (dryRun) => {
@@ -398,9 +408,12 @@ async function renderPush() {
     pushOut.textContent = "Starting…";
     const { run_id, command } = await post("/api/mainpush", {
       brand: brandSel.value,
+      rate: rateIn.value,
       batch_size: batchIn.value,
       batch_pause: pauseIn.value,
-      limit: limitIn.value || null,
+      // Preview samples rather than enumerating everything - 20 records
+      // answers "does the payload look right" as well as 4,000 would
+      limit: dryRun ? (limitIn.value || 20) : (limitIn.value || null),
       dry_run: dryRun,
     });
     pushOut.textContent = "$ " + command + "\n";
@@ -425,19 +438,23 @@ async function renderPush() {
     panel("Push to Como", el("div", {}, [
       el("div", { class: "row", style: "margin-bottom:10px" }, [
         el("span", { class: "label" }, "Brand"), brandSel,
-        el("span", { class: "label" }, "Batch of"), batchIn,
-        el("span", { class: "label" }, "then wait (sec)"), pauseIn,
+        el("span", { class: "label" }, "Calls/min"), rateIn,
         el("span", { class: "label" }, "Cap at"), limitIn,
+      ]),
+      el("div", { class: "row", style: "margin-bottom:10px" }, [
+        el("span", { class: "label" }, "Optional pacing — batch of"), batchIn,
+        el("span", { class: "label" }, "then wait (sec)"), pauseIn,
       ]),
       estimate,
       el("div", { class: "row", style: "margin-bottom:12px" },
          [previewBtn, startBtn]),
       pushOut,
       el("div", { class: "note" },
-        "Pacing doesn't reduce the number of API calls, only the rate. " +
-        "Como's fair usage policy warns about sustained sequential access " +
-        "on one key, so keep the rate modest and tell your account manager " +
-        "before a large backfill. The run keeps going if you close this tab."),
+        "Como allows 500 calls per minute. 300 leaves headroom without " +
+        "dragging the run out. The batch fields are only useful if you " +
+        "want to spread a run over hours — at 300/min you shouldn't need " +
+        "them. Preview samples 20 records unless you set a cap. The run " +
+        "keeps going if you close this tab."),
     ]))));
 
   // ── Test push: one person ──────────────────────────────────────

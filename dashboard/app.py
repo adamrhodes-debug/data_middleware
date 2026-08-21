@@ -518,6 +518,10 @@ def api_mainpush():
     if brand and brand != "ALL":
         cmd += ["--brand", brand]
 
+    rate = int(body.get("rate") or 0)
+    if rate:
+        cmd += ["--rate", str(min(rate, 500))]   # Como's ceiling
+
     if body.get("limit"):
         cmd += ["--limit", str(int(body["limit"]))]
 
@@ -599,10 +603,15 @@ def api_pushplan():
                   WHERE s.email = m.email AND s.status IN ('ok','exists'))
             """, (brand,), one=True)["n"] if table_exists("como_push_state") else 0
 
-    per_record = float(os.environ.get("COMO_REQUEST_DELAY_SECONDS", "0.5"))
+    rate = int(request.args.get("rate") or 0)
+    if rate:
+        per_call = 60.0 / max(rate, 1)
+    else:
+        per_call = float(os.environ.get("COMO_REQUEST_DELAY_SECONDS", "0.5"))
+
     # roughly one existence check, plus a create for people not there yet
     calls = int(queued * 1.5)
-    seconds = queued * per_record * 1.5
+    seconds = calls * per_call
     batches = 0
     if batch and pause and queued:
         batches = (queued + batch - 1) // batch
@@ -614,6 +623,8 @@ def api_pushplan():
         "batches": batches,
         "seconds": int(seconds),
         "human": _human_time(seconds),
+        "rate": rate or int(60 / per_call),
+        "over_limit": bool(rate and rate > 500),
     })
 
 
