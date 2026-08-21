@@ -430,6 +430,159 @@ def api_push():
     return jsonify({"exists": True, "brands": rows})
 
 
+# ── Newsletter signups from the websites ─────────────────────────
+# The websites POST here when someone signs up. We write to Postgres
+# immediately (so nothing is ever lost) and push to Como in the
+# background (so a slow or unreachable Como doesn't hang the form).
+#
+# This route is NOT behind the dashboard's normal auth - websites
+# can't sign in - so it's protected by a shared secret instead.
+# Set SIGNUP_SECRET in .env and put the same value in the website.
+
+SIGNUP_SECRET = os.environ.get("SIGNUP_SECRET", "")
+
+# Which Como account each site's signups belong to.
+SITE_BRANDS = {
+    "pickl": "PICKL",
+    "eatpickl": "PICKL",
+    "bonbird": "BONBIRD",
+    "southpour": "SOUTHPOUR",
+}
+
+
+def _como_signup(email, brand, first_name=None, last_name=None):
+    """Create this person in Como right away. Runs in a background
+    thread - the website has already had its response by now."""
+    import requests
+
+    key = os.environ.get(f"{brand}_COMO_API_KEY", "").strip()
+    if not key:
+        return "failed", f"no API key configured for {brand}"
+
+    base = os.environ.get("COMO_BASE_URL", "https://api.prod.bcomo.com")
+    head = {
+        "Content-Type": "application/json",
+        "X-Api-Key": key,
+        "X-Branch-Id": os.environ.get(f"{brand}_COMO_BRANCH_ID", ""),
+        "X-Pos-Id": os.environ.get(f"{brand}_COMO_POS_ID", "1"),
+        "X-Source-Type": os.environ.get(f"{brand}_COMO_SOURCE_TYPE", "Backoffice"),
+        "X-Source-Name": "NewsletterSignup",
+        "X-Source-Version": "1.0.0",
+    }
+
+    fields = {"email": email, "allowEmail": True}
+    if first_name:
+        fields["firstName"] = first_name
+    if last_name:
+        fields["lastName"] = last_name
+
+    # Source / brand / country into their configured generic fields
+    for env_key, value in (
+        (f"{brand}_COMO_FIELD_SOURCE", "NEWSLETTER"),
+        (f"{brand}_COMO_FIELD_BRAND", brand),
+        (f"{brand}_COMO_FIELD_COUNTRY", "UAE"),
+    ):
+        field = os.environ.get(env_key, "").strip()
+        if field:
+            fields[field] = value
+
+    try:
+        r = requests.post(f"{base}/api/v4/advanced/registration/quick",
+                          json={"customer": fields}, headers=head, timeout=20)
+        body = r.json()
+    except Exception as exc:
+        return "failed", str(exc)[:300]
+
+    if body.get("status") == "ok":
+        return "ok", "created"
+
+    text = json.dumps(body)
+    if "already exists" in text:
+        return "exists", "already in Como"
+    return "failed", text[:300]
+
+
+def _record_como_result(email, status, detail):
+    try:
+        execute("""UPDATE newsletter_signups
+                   SET como_status = %s, como_detail = %s, como_at = now()
+                   WHERE email = %s""", (status, detail, email))
+    except Exception:
+        pass
+
+
+@app.route("/api/signup", methods=["POST"])
+def api_signup():
+    if not SIGNUP_SECRET:
+        return jsonify({"error": "signups not configured"}), 503
+
+    if request.headers.get("X-Signup-Secret", "") != SIGNUP_SECRET:
+        return jsonify({"error": "unauthorised"}), 401
+
+    body = request.get_json(force=True, silent=True) or request.form
+    email = (body.get("email") or "").strip().lower()
+
+    if not email or "@" not in email:
+        return jsonify({"error": "a valid email is required"}), 400
+
+    site = (body.get("site") or "").strip().lower()
+    brand = (body.get("brand") or SITE_BRANDS.get(site) or "").strip().upper()
+    if brand not in ("PICKL", "BONBIRD", "SOUTHPOUR"):
+        return jsonify({"error": f"unknown site or brand: {site or brand}"}), 400
+
+    country = (body.get("country") or "UAE").strip().upper()
+    first = (body.get("first_name") or "").strip() or None
+    last = (body.get("last_name") or "").strip() or None
+    page = (body.get("page") or "").strip() or None
+
+    # 1. Store it. This is the bit that must not fail.
+    try:
+        execute("""
+            INSERT INTO newsletter_signups
+                (email, brand, country, site, page, first_name, last_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET
+                brand      = COALESCE(newsletter_signups.brand, EXCLUDED.brand),
+                country    = COALESCE(newsletter_signups.country, EXCLUDED.country),
+                first_name = COALESCE(EXCLUDED.first_name, newsletter_signups.first_name),
+                last_name  = COALESCE(EXCLUDED.last_name, newsletter_signups.last_name),
+                updated_at = now()
+        """, (email, brand, country, site, page, first, last))
+    except Exception as exc:
+        return jsonify({"error": "couldn't save", "detail": str(exc)[:200]}), 500
+
+    # 2. Push to Como without making the website wait for it.
+    def worker():
+        status, detail = _como_signup(email, brand, first, last)
+        _record_como_result(email, status, detail)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    return jsonify({"ok": True, "email": email, "brand": brand})
+
+
+@app.route("/api/signups")
+@protected
+def api_signups():
+    if not table_exists("newsletter_signups"):
+        return jsonify({"rows": [], "totals": {}})
+    return jsonify({
+        "totals": clean(query("""
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE como_status = 'ok') AS pushed,
+                   count(*) FILTER (WHERE como_status = 'exists') AS already_there,
+                   count(*) FILTER (WHERE como_status = 'failed') AS failed,
+                   count(*) FILTER (WHERE como_status IS NULL) AS not_tried
+            FROM newsletter_signups""", one=True)),
+        "by_brand": clean(query("""
+            SELECT brand, site, count(*) AS n
+            FROM newsletter_signups GROUP BY 1,2 ORDER BY 3 DESC""")),
+        "rows": clean(query("""
+            SELECT email, brand, site, como_status, como_detail, signed_up_at
+            FROM newsletter_signups ORDER BY signed_up_at DESC LIMIT 50""")),
+    })
+
+
 # ── Pre-flight: prove no duplicates can reach Como ───────────────
 
 @app.route("/api/preflight")
