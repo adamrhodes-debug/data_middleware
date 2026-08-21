@@ -196,23 +196,30 @@ def call(cfg, path, payload, advanced=True):
         return r.status_code, None
 
 
+def member_ids(body):
+    """Pull Como's own identifiers out of a membership response."""
+    m = (body or {}).get("membership") or {}
+    return m.get("comoMemberId"), m.get("commonExtId")
+
+
 def member_exists(cfg, email):
     """Ask Como whether this email is already a member.
 
-    Returns True, False, or None if we couldn't tell. Read-only - it
-    never modifies anything.
+    Returns (found, comoMemberId, commonExtId) where found is True,
+    False, or None if we couldn't tell. Read-only - never modifies.
     """
     try:
         _, body = call(cfg, "getMemberDetails",
                        {"customer": {"email": email}}, advanced=False)
     except requests.RequestException:
-        return None
+        return None, None, None
 
     if body and body.get("status") == "ok":
-        return True
+        cid, ext = member_ids(body)
+        return True, cid, ext
     if CUSTOMER_NOT_FOUND in error_codes(body):
-        return False
-    return None
+        return False, None, None
+    return None, None, None
 
 
 def error_codes(body):
@@ -239,28 +246,28 @@ def push_one(row, cfg, update_existing=False):
     fields = registration_data(row, cfg)
 
     if not update_existing:
-        found = member_exists(cfg, email)
+        found, cid, ext = member_exists(cfg, email)
 
         if found is True:
-            return "exists", "already in Como - left alone"
+            return "exists", "already in Como - left alone", (cid, ext)
 
         if found is None:
-            return "failed", "couldn't check whether they exist"
+            return "failed", "couldn't check whether they exist", (None, None)
 
         # Not a member yet - create them.
         try:
             _, body = call(cfg, "registration/quick",
                            {"customer": {"email": email, **fields}})
         except requests.RequestException as exc:
-            return "failed", str(exc)
+            return "failed", str(exc), (None, None)
 
         if body and body.get("status") == "ok":
-            return "ok", "created"
+            return "ok", "created", member_ids(body)
         if ALREADY_EXISTS in error_codes(body):
             # Created between our check and this call, or the address
             # belongs to a different membership.
-            return "exists", "already in Como"
-        return "failed", json.dumps(body)[:200]
+            return "exists", "already in Como", (None, None)
+        return "failed", json.dumps(body)[:200], (None, None)
 
     # --- update-existing mode ---
     try:
@@ -269,10 +276,11 @@ def push_one(row, cfg, update_existing=False):
             "registrationData": fields,
         })
     except requests.RequestException as exc:
-        return "failed", str(exc)
+        return "failed", str(exc), (None, None)
 
     if body and body.get("status") == "ok":
-        return "ok", "updated"
+        # updateMember returns only {"status":"ok"} - no ids to capture
+        return "ok", "updated", (None, None)
 
     codes = error_codes(body)
 
@@ -281,17 +289,17 @@ def push_one(row, cfg, update_existing=False):
             _, body = call(cfg, "registration/quick",
                            {"customer": {"email": email, **fields}})
         except requests.RequestException as exc:
-            return "failed", str(exc)
+            return "failed", str(exc), (None, None)
         if body and body.get("status") == "ok":
-            return "ok", "created"
+            return "ok", "created", member_ids(body)
         if ALREADY_EXISTS in error_codes(body):
-            return "conflict", json.dumps(body)[:200]
-        return "failed", json.dumps(body)[:200]
+            return "conflict", json.dumps(body)[:200], (None, None)
+        return "failed", json.dumps(body)[:200], (None, None)
 
     if ALREADY_EXISTS in codes:
-        return "conflict", json.dumps(body)[:200]
+        return "conflict", json.dumps(body)[:200], (None, None)
 
-    return "failed", json.dumps(body)[:200]
+    return "failed", json.dumps(body)[:200], (None, None)
 
 
 # ── Push state, tracked per brand ────────────────────────────────
@@ -300,32 +308,53 @@ def ensure_state_table(conn):
     with conn.cursor() as cur:
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
-                email          TEXT NOT NULL,
-                brand          TEXT NOT NULL,
-                status         TEXT NOT NULL,
-                detail         TEXT,
-                last_pushed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                email           TEXT NOT NULL,
+                brand           TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                detail          TEXT,
+                -- Como's own identifiers. comoMemberId is their canonical
+                -- internal key - it survives the member changing their
+                -- email, which ours doesn't, so it's worth keeping.
+                como_member_id  TEXT,
+                common_ext_id   TEXT,
+                last_pushed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (email, brand)
             )
         """)
+        cur.execute(f"ALTER TABLE {STATE_TABLE} "
+                    f"ADD COLUMN IF NOT EXISTS como_member_id TEXT")
+        cur.execute(f"ALTER TABLE {STATE_TABLE} "
+                    f"ADD COLUMN IF NOT EXISTS common_ext_id TEXT")
         cur.execute(
             f"CREATE INDEX IF NOT EXISTS {STATE_TABLE}_status_idx "
             f"ON {STATE_TABLE} (brand, status)")
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS {STATE_TABLE}_member_idx "
+            f"ON {STATE_TABLE} (como_member_id)")
     conn.commit()
 
 
-def record(conn, email, brand, status, detail):
+def record(conn, email, brand, status, detail,
+           como_member_id=None, common_ext_id=None):
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            INSERT INTO {STATE_TABLE} (email, brand, status, detail, last_pushed_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO {STATE_TABLE}
+                (email, brand, status, detail,
+                 como_member_id, common_ext_id, last_pushed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (email, brand) DO UPDATE SET
                 status = EXCLUDED.status,
                 detail = EXCLUDED.detail,
+                -- Never overwrite an id we already hold with a null
+                como_member_id = COALESCE(EXCLUDED.como_member_id,
+                                          {STATE_TABLE}.como_member_id),
+                common_ext_id  = COALESCE(EXCLUDED.common_ext_id,
+                                          {STATE_TABLE}.common_ext_id),
                 last_pushed_at = now()
             """,
-            (email, brand, status, (detail or "")[:500]),
+            (email, brand, status, (detail or "")[:500],
+             como_member_id, common_ext_id),
         )
     conn.commit()
 
@@ -441,12 +470,15 @@ def push_single(email, only_brand=None, dry_run=False):
         if dry_run:
             continue
 
-        exists = member_exists(cfg, email)
+        exists, _, _ = member_exists(cfg, email)
         print(f"  already in Como: {exists}")
 
-        status, detail = push_one(row, cfg)
-        record(conn, email, name, status, detail)
+        status, detail, ids = push_one(row, cfg)
+        record(conn, email, name, status, detail,
+               como_member_id=ids[0], common_ext_id=ids[1])
         print(f"  result: {status} - {detail}")
+        if ids[0]:
+            print(f"  comoMemberId: {ids[0]}")
 
         # Read the member back so you can see exactly what Como stored
         try:
@@ -493,9 +525,11 @@ def run(only_brand=None, limit=None, dry_run=False, retry_failed=False,
                 print(f"            {json.dumps(registration_data(row, cfg))}")
                 continue
 
-            status, detail = push_one(row, cfg, update_existing=update_existing)
+            status, detail, ids = push_one(row, cfg,
+                                           update_existing=update_existing)
             counts[status] = counts.get(status, 0) + 1
-            record(conn, row["email"], name, status, detail)
+            record(conn, row["email"], name, status, detail,
+                   como_member_id=ids[0], common_ext_id=ids[1])
 
             marker = {"ok": "+", "exists": "=", "failed": "!",
                       "conflict": "?"}.get(status, " ")
