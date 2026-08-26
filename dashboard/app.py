@@ -450,9 +450,14 @@ SITE_BRANDS = {
 }
 
 
-def _como_signup(email, brand, first_name=None, last_name=None):
+def _como_signup(email, brand, first_name=None, last_name=None,
+                 source="NEWSLETTER", country="UAE"):
     """Create this person in Como right away. Runs in a background
-    thread - the website has already had its response by now."""
+    thread - the website has already had its response by now.
+
+    `source` is whatever the website sent (NEWSLETTER, CONTACT_FORM,
+    ...) and goes into the SOURCE generic field, so a contact-form
+    signup isn't mislabelled as a newsletter opt-in in Como."""
     import requests
 
     key = os.environ.get(f"{brand}_COMO_API_KEY", "").strip()
@@ -478,9 +483,9 @@ def _como_signup(email, brand, first_name=None, last_name=None):
 
     # Source / brand / country into their configured generic fields
     for env_key, value in (
-        (f"{brand}_COMO_FIELD_SOURCE", "NEWSLETTER"),
+        (f"{brand}_COMO_FIELD_SOURCE", source),
         (f"{brand}_COMO_FIELD_BRAND", brand),
-        (f"{brand}_COMO_FIELD_COUNTRY", "UAE"),
+        (f"{brand}_COMO_FIELD_COUNTRY", country),
     ):
         field = os.environ.get(env_key, "").strip()
         if field:
@@ -535,30 +540,41 @@ def api_signup():
     last = (body.get("last_name") or "").strip() or None
     page = (body.get("page") or "").strip() or None
 
+    # Which form this came from. The website sends 'newsletter',
+    # 'contact_form', etc. Store it uppercased so it sits alongside
+    # WIFI / REVEL in src_system rather than as odd lowercase.
+    # Falls back to NEWSLETTER so the original form (which sends no
+    # source) keeps behaving exactly as before.
+    source = (body.get("source") or "newsletter").strip().upper() or "NEWSLETTER"
+
     # 1. Store it. This is the bit that must not fail.
     try:
         execute("""
             INSERT INTO newsletter_signups
-                (email, brand, country, site, page, first_name, last_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (email, brand, country, site, page, first_name, last_name,
+                 src_system)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (email) DO UPDATE SET
                 brand      = COALESCE(newsletter_signups.brand, EXCLUDED.brand),
                 country    = COALESCE(newsletter_signups.country, EXCLUDED.country),
                 first_name = COALESCE(EXCLUDED.first_name, newsletter_signups.first_name),
                 last_name  = COALESCE(EXCLUDED.last_name, newsletter_signups.last_name),
+                src_system = EXCLUDED.src_system,
                 updated_at = now()
-        """, (email, brand, country, site, page, first, last))
+        """, (email, brand, country, site, page, first, last, source))
     except Exception as exc:
         return jsonify({"error": "couldn't save", "detail": str(exc)[:200]}), 500
 
     # 2. Push to Como without making the website wait for it.
     def worker():
-        status, detail = _como_signup(email, brand, first, last)
+        status, detail = _como_signup(email, brand, first, last,
+                                      source=source, country=country)
         _record_como_result(email, status, detail)
 
     threading.Thread(target=worker, daemon=True).start()
 
-    return jsonify({"ok": True, "email": email, "brand": brand})
+    return jsonify({"ok": True, "email": email, "brand": brand,
+                    "source": source})
 
 
 @app.route("/api/signups")
