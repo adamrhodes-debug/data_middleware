@@ -1,0 +1,23 @@
+[Unit]
+Description=Wi-fi sync then push new guests to Como
+# Wait for the database before running.
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Runs as the same user that owns the integrations folders and venvs.
+User=apps
+Group=apps
+
+WorkingDirectory=/home/apps/integrations
+ExecStart=/usr/bin/bash /home/apps/integrations/sync_wifi.sh
+
+# Don't let a run hang forever - if a sync wedges, kill it well before
+# the next tick so runs can't pile up.
+TimeoutStartSec=240
+
+# Be a quiet neighbour to the dashboard and Postgres on the same VM.
+Nice=10
+IOSchedulingClass=idle

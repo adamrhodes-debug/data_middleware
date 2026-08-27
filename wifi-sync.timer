@@ -1,0 +1,20 @@
+[Unit]
+Description=Run the wi-fi sync + Como push every 5 minutes
+
+[Timer]
+# First run 2 minutes after boot, so the VM settles first.
+OnBootSec=2min
+
+# Then every 5 minutes, measured from when the last run FINISHED - so a
+# slow run can never overlap the next one.
+OnUnitInactiveSec=5min
+
+# Don't fire all timers at the exact same instant on a busy box.
+AccuracySec=30s
+
+# If the VM was off, don't fire a backlog of missed runs on boot - just
+# resume the schedule.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
