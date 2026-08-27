@@ -353,8 +353,12 @@ async function renderPush() {
   // ── Main push, paced ───────────────────────────────────────────
   const brandSel = el("select", {}, [
     el("option", { value: "ALL" }, "All configured brands"),
-    ...p.brands.filter(b => b.configured)
-              .map(b => el("option", { value: b.brand }, b.brand)),
+    // Every known brand, not just configured ones. A brand with no key
+    // still pushes - each record just fails on the missing key - but
+    // listing them lets you run one brand on its own, which is the
+    // whole point when only some brands are set up yet.
+    ...p.brands.map(b => el("option", { value: b.brand },
+        b.brand + (b.configured ? "" : " (no key)"))),
   ]);
   const rateIn = el("input", { type: "text", value: "300", style: "width:70px" });
   const batchIn = el("input", { type: "text", placeholder: "off",
