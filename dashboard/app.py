@@ -509,7 +509,7 @@ def _como_signup(email, brand, first_name=None, last_name=None,
 
 def _record_como_result(email, status, detail):
     try:
-        execute("""UPDATE newsletter_signups
+        execute("""UPDATE website_signups
                    SET como_status = %s, como_detail = %s, como_at = now()
                    WHERE email = %s""", (status, detail, email))
     except Exception:
@@ -550,15 +550,15 @@ def api_signup():
     # 1. Store it. This is the bit that must not fail.
     try:
         execute("""
-            INSERT INTO newsletter_signups
+            INSERT INTO website_signups
                 (email, brand, country, site, page, first_name, last_name,
                  src_system)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (email) DO UPDATE SET
-                brand      = COALESCE(newsletter_signups.brand, EXCLUDED.brand),
-                country    = COALESCE(newsletter_signups.country, EXCLUDED.country),
-                first_name = COALESCE(EXCLUDED.first_name, newsletter_signups.first_name),
-                last_name  = COALESCE(EXCLUDED.last_name, newsletter_signups.last_name),
+                brand      = COALESCE(website_signups.brand, EXCLUDED.brand),
+                country    = COALESCE(website_signups.country, EXCLUDED.country),
+                first_name = COALESCE(EXCLUDED.first_name, website_signups.first_name),
+                last_name  = COALESCE(EXCLUDED.last_name, website_signups.last_name),
                 src_system = EXCLUDED.src_system,
                 updated_at = now()
         """, (email, brand, country, site, page, first, last, source))
@@ -580,7 +580,7 @@ def api_signup():
 @app.route("/api/signups")
 @protected
 def api_signups():
-    if not table_exists("newsletter_signups"):
+    if not table_exists("website_signups"):
         return jsonify({"rows": [], "totals": {}})
     return jsonify({
         "totals": clean(query("""
@@ -589,13 +589,13 @@ def api_signups():
                    count(*) FILTER (WHERE como_status = 'exists') AS already_there,
                    count(*) FILTER (WHERE como_status = 'failed') AS failed,
                    count(*) FILTER (WHERE como_status IS NULL) AS not_tried
-            FROM newsletter_signups""", one=True)),
+            FROM website_signups""", one=True)),
         "by_brand": clean(query("""
             SELECT brand, site, count(*) AS n
-            FROM newsletter_signups GROUP BY 1,2 ORDER BY 3 DESC""")),
+            FROM website_signups GROUP BY 1,2 ORDER BY 3 DESC""")),
         "rows": clean(query("""
             SELECT email, brand, site, como_status, como_detail, signed_up_at
-            FROM newsletter_signups ORDER BY signed_up_at DESC LIMIT 50""")),
+            FROM website_signups ORDER BY signed_up_at DESC LIMIT 50""")),
     })
 
 
